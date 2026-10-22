@@ -1,0 +1,552 @@
+USE master;
+GO
+
+IF EXISTS (SELECT * FROM sys.databases WHERE name = 'CompanySecurityDB')
+BEGIN
+ALTER DATABASE CompanySecurityDB SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
+DROP DATABASE CompanySecurityDB;
+END
+GO
+
+IF EXISTS (SELECT * FROM sys.server_principals WHERE name = 'user_public') DROP LOGIN user_public;
+IF EXISTS (SELECT * FROM sys.server_principals WHERE name = 'user_admin')  DROP LOGIN user_admin;
+GO
+
+CREATE DATABASE CompanySecurityDB;
+GO
+
+USE CompanySecurityDB;
+GO
+
+CREATE TABLE Employees
+(
+EmpID INT NOT NULL PRIMARY KEY,
+FullName VARCHAR(50) NOT NULL,
+Dept VARCHAR(20) NULL,
+Title VARCHAR(20) NULL,
+Grade VARCHAR(20) NULL,
+Bonus INT NULL,
+Salary INT NOT NULL
+);
+GO
+
+INSERT INTO Employees (EmpID, FullName, Dept, Title, Grade, Bonus, Salary)
+VALUES
+(1, 'Ali',   'Marketing',  'Coordinator', 'G2', 12000, 120000),
+(2, 'Asser', 'Marketing',  'Coordinator', 'G2', 12000, 110000),
+(3, 'Mona',  'Operations', 'Supervisor',  'G3', 18000, 100000),
+(4, 'Fatma', 'Operations', 'Assistant',   'G1', 8000,  90000),
+(5, 'Gehad', 'Finance',    'Assistant',   'G1', 8000,  80000),
+(6, 'Ahmed', 'IT',         'Supervisor',  'G3', 18000, 70000);
+GO
+
+USE master;
+GO
+
+CREATE LOGIN user_public WITH PASSWORD = 'Pub@Pass2026';
+CREATE LOGIN user_admin  WITH PASSWORD = 'Adm@Pass2026';
+GO
+
+USE CompanySecurityDB;
+GO
+
+CREATE USER general FOR LOGIN user_public;
+CREATE USER admin1  FOR LOGIN user_admin;
+GO
+
+CREATE ROLE public_role;
+CREATE ROLE admin_role;
+GO
+
+ALTER ROLE public_role ADD MEMBER general;
+ALTER ROLE admin_role  ADD MEMBER admin1;
+GO
+
+CREATE VIEW dbo.vw_Employees_Public
+AS
+SELECT
+LEFT(FullName, 1) + REPLICATE('*', LEN(FullName) - 1) AS MaskedName,
+Dept,
+Title,
+Grade
+FROM dbo.Employees;
+GO
+
+GRANT SELECT ON dbo.vw_Employees_Public TO public_role;
+DENY  SELECT, INSERT, UPDATE, DELETE ON dbo.Employees TO public_role;
+GRANT SELECT, INSERT, UPDATE, DELETE ON SCHEMA::dbo TO admin_role;
+GO
+
+EXECUTE AS USER = 'general';
+SELECT USER_NAME() AS CurrentUser;
+SELECT * FROM dbo.vw_Employees_Public;
+REVERT;
+GO
+
+EXECUTE AS USER = 'general';
+SELECT * FROM dbo.Employees;
+REVERT;
+GO
+
+EXECUTE AS USER = 'general';
+UPDATE dbo.Employees SET Salary = 1 WHERE EmpID = 1;
+REVERT;
+GO
+
+EXECUTE AS USER = 'admin1';
+SELECT USER_NAME() AS CurrentUser;
+SELECT * FROM dbo.Employees;
+REVERT;
+GO
+
+EXECUTE AS USER = 'admin1';
+UPDATE dbo.Employees SET Bonus = 9000 WHERE EmpID = 4;
+SELECT * FROM dbo.Employees WHERE EmpID = 4;
+REVERT;
+GO
+
+CREATE TABLE dbo.DeptDirectory
+(
+Dept VARCHAR(20) PRIMARY KEY,
+Location VARCHAR(30),
+Phone VARCHAR(10)
+);
+GO
+
+INSERT INTO dbo.DeptDirectory (Dept, Location, Phone)
+VALUES
+('Marketing',  'Floor 1', '101'),
+('Operations', 'Floor 2', '202'),
+('Finance',    'Floor 3', '303'),
+('IT',         'Floor 4', '404');
+GO
+
+CREATE VIEW dbo.vw_EmployeeDirectory
+AS
+SELECT
+e.EmpID,
+e.FullName,
+e.Dept,
+e.Title,
+e.Salary,
+e.Bonus,
+d.Location,
+d.Phone
+FROM dbo.Employees AS e
+JOIN dbo.DeptDirectory AS d ON d.Dept = e.Dept;
+GO
+
+GRANT SELECT ON dbo.DeptDirectory TO public;
+GRANT SELECT ON dbo.vw_EmployeeDirectory TO public;
+GO
+
+EXECUTE AS USER = 'general';
+SELECT USER_NAME() AS CurrentUser;
+SELECT * FROM dbo.vw_EmployeeDirectory;
+REVERT;
+GO
+
+SELECT OBJECT_NAME(major_id) AS ObjectName, permission_name, state_desc
+FROM sys.database_permissions
+WHERE grantee_principal_id = DATABASE_PRINCIPAL_ID('public')
+AND class = 1;
+GO
+
+/*
+How the attack works:
+Every database user is automatically a member of the PUBLIC role, so general
+inherits the SELECT permission on vw_EmployeeDirectory.
+The view and the Employees table have the same owner (dbo), so because of
+ownership chaining SQL Server checks the permission on the view only and does
+not check the permissions on Employees.
+That is why the DENY on Employees for public_role is skipped and general can
+read FullName, Salary and Bonus through the view.
+
+How to fix it:
+
+Revoke the permission from PUBLIC.
+
+Remove the sensitive columns from the view (mask the name, drop Salary and Bonus).
+
+Grant the view to specific roles only, never to PUBLIC.
+*/
+
+REVOKE SELECT ON dbo.vw_EmployeeDirectory FROM public;
+GO
+
+ALTER VIEW dbo.vw_EmployeeDirectory
+AS
+SELECT
+LEFT(e.FullName, 1) + REPLICATE('*', LEN(e.FullName) - 1) AS MaskedName,
+e.Dept,
+e.Title,
+d.Location,
+d.Phone
+FROM dbo.Employees AS e
+JOIN dbo.DeptDirectory AS d ON d.Dept = e.Dept;
+GO
+
+GRANT SELECT ON dbo.vw_EmployeeDirectory TO public_role;
+GO
+
+EXECUTE AS USER = 'general';
+SELECT USER_NAME() AS CurrentUser;
+SELECT * FROM dbo.vw_EmployeeDirectory;
+REVERT;
+GO
+
+SELECT OBJECT_NAME(major_id) AS ObjectName, permission_name, state_desc
+FROM sys.database_permissions
+WHERE grantee_principal_id = DATABASE_PRINCIPAL_ID('public')
+AND class = 1;
+GO
+
+/* =========================================
+Part 2 - RBAC Implementation
+========================================= */
+
+-- 1. Create the base roles
+CREATE ROLE read_onlyX;
+CREATE ROLE insert_onlyX;
+GO
+
+-- 2. Create users
+CREATE USER ReadUser WITHOUT LOGIN;
+CREATE USER InsertUser WITHOUT LOGIN;
+GO
+
+-- 3. Assign users to roles
+ALTER ROLE read_onlyX ADD MEMBER ReadUser;
+ALTER ROLE insert_onlyX ADD MEMBER InsertUser;
+GO
+
+-- 4. Grant permissions
+GRANT SELECT ON dbo.Employees TO read_onlyX;
+GRANT INSERT ON dbo.Employees TO insert_onlyX;
+GO
+
+-- 5. Create a composite role
+CREATE ROLE power_user;
+GO
+
+-- 6. Add base roles to the composite role
+ALTER ROLE read_onlyX ADD MEMBER power_user;
+ALTER ROLE insert_onlyX ADD MEMBER power_user;
+GO
+
+-- 7. Create EMPLOYEE2 and assign to power_user
+CREATE USER EMPLOYEE2 WITHOUT LOGIN;
+ALTER ROLE power_user ADD MEMBER EMPLOYEE2;
+GO
+
+-- 8. Apply least privilege
+REVOKE SELECT ON dbo.Employees FROM read_onlyX;
+
+GRANT SELECT ON dbo.Employees
+(EmpID, FullName, Dept, Title, Grade)
+TO read_onlyX;
+GO
+
+-- 9. Test ReadUser
+EXECUTE AS USER = 'ReadUser';
+
+SELECT USER_NAME() AS CurrentUser;
+
+-- Expected: SUCCEEDED
+SELECT EmpID, FullName, Dept, Title, Grade
+FROM dbo.Employees;
+
+-- Expected: DENIED
+INSERT INTO dbo.Employees
+(EmpID, FullName, Dept, Title, Grade, Bonus, Salary)
+VALUES
+(7, 'Test User', 'IT', 'Assistant', 'G1', 5000, 50000);
+
+REVERT;
+GO
+
+-- 10. Test InsertUser
+EXECUTE AS USER = 'InsertUser';
+
+SELECT USER_NAME() AS CurrentUser;
+
+-- Expected: SUCCEEDED
+INSERT INTO dbo.Employees
+(EmpID, FullName, Dept, Title, Grade, Bonus, Salary)
+VALUES
+(8, 'Test User', 'IT', 'Assistant', 'G1', 5000, 50000);
+
+-- Expected: DENIED
+SELECT EmpID
+FROM dbo.Employees;
+
+REVERT;
+GO
+
+-- 11. Test EMPLOYEE2 with both privileges
+EXECUTE AS USER = 'EMPLOYEE2';
+
+SELECT USER_NAME() AS CurrentUser;
+
+-- Expected: SUCCEEDED
+SELECT EmpID, FullName, Dept, Title, Grade
+FROM dbo.Employees;
+
+-- Expected: SUCCEEDED
+INSERT INTO dbo.Employees
+(EmpID, FullName, Dept, Title, Grade, Bonus, Salary)
+VALUES
+(10, 'Power Test', 'IT', 'Supervisor', 'G3', 18000, 60000);
+
+REVERT;
+GO
+
+-- 12. Remove insert_onlyX from power_user
+ALTER ROLE insert_onlyX DROP MEMBER power_user;
+GO
+
+-- 13. Test EMPLOYEE2 again: SELECT only
+EXECUTE AS USER = 'EMPLOYEE2';
+
+SELECT USER_NAME() AS CurrentUser;
+
+-- Expected: SUCCEEDED
+SELECT EmpID, FullName, Dept, Title, Grade
+FROM dbo.Employees;
+
+-- Expected: DENIED
+INSERT INTO dbo.Employees
+(EmpID, FullName, Dept, Title, Grade, Bonus, Salary)
+VALUES
+(11, 'Power Test 2', 'IT', 'Assistant', 'G1', 5000, 60000);
+
+REVERT;
+GO
+
+-- 14. Clean up test records
+DELETE FROM dbo.Employees
+WHERE EmpID IN (8, 10);
+GO
+
+/* =========================================================
+PART 3 - Functional Dependency Inference
+Database: CompanySecurityDB
+Table: Employees
+========================================================= */
+
+USE CompanySecurityDB;
+GO
+
+/* =========================================================
+GIVEN FUNCTIONAL DEPENDENCIES
+========================================================= */
+
+/*
+FD1: EmpID -> Dept
+FD2: Title -> Grade
+FD3: Dept, Grade -> Bonus
+
+Students must:
+
+Compute closure Q+ of {Dept, Title}.
+
+Show Bonus ∈ Q+.
+
+Decide whether to reject or transform the query.
+*/
+
+/* =========================================================
+CREATE PUBLIC VIEW
+========================================================= */
+
+IF OBJECT_ID('dbo.vw_EmployeesPublic', 'V') IS NOT NULL
+DROP VIEW dbo.vw_EmployeesPublic;
+GO
+
+CREATE VIEW dbo.vw_EmployeesPublic
+AS
+SELECT
+EmpID,
+FullName,
+Dept
+FROM dbo.Employees;
+GO
+
+/* =========================================================
+GRANT ACCESS TO THE VIEW
+========================================================= */
+
+GRANT SELECT ON dbo.vw_EmployeesPublic TO public_role;
+GO
+
+/* =========================================================
+PART 3 - CLOSURE OF {Dept, Title}
+========================================================= */
+/*
+Initial:
+Q+ = {Dept, Title}
+
+FD1:
+EmpID -> Dept
+EmpID is not in Q+, so FD1 adds nothing
+
+FD2:
+Title -> Grade
+
+Therefore:
+Q+ = {Dept, Title, Grade}
+
+FD3:
+Dept, Grade -> Bonus
+
+Therefore:
+Q+ = {Dept, Title, Grade, Bonus}
+
+So:
+Bonus ∈ Q+
+*/
+/* =========================================================
+SHOW THE CLOSURE
+========================================================= */
+
+SELECT
+'Dept' AS Attribute
+UNION ALL
+SELECT
+'Title'
+UNION ALL
+SELECT
+'Grade'
+UNION ALL
+SELECT
+'Bonus';
+GO
+/* =========================================================
+SHOW BONUS
+========================================================= */
+
+SELECT
+Dept,
+Title,
+Bonus
+FROM dbo.Employees;
+GO
+/* =========================================================
+DECISION - TRANSFORM QUERY
+========================================================= */
+/*
+Because Bonus is inferable from {Dept, Title}
+using the given Functional Dependencies,
+exposing Dept and Title together with Bonus
+creates an inference channel.
+
+Therefore, the query should be TRANSFORMED
+rather than simply rejected.
+
+We return only non-sensitive attributes.
+Title is removed, so the closure is {EmpID, FullName, Dept}
+and Bonus is not in it.
+*/
+SELECT
+EmpID,
+FullName,
+Dept
+FROM dbo.Employees;
+GO
+/* =========================================================
+TRY ACCESS AS EMPLOYEE
+========================================================= */
+EXECUTE AS USER = 'general';
+
+SELECT USER_NAME() AS CURRENT_NAME;
+
+-- Expected: SUCCEEDED
+SELECT
+    EmpID,
+    FullName,
+    Dept
+FROM dbo.vw_EmployeesPublic;
+
+REVERT;
+GO
+
+/* =========================================
+Part 4 - Inference via Aggregates
+========================================= */
+
+/* 1. AVG views including and excluding the target user (EmpID 6 = Ahmed) */
+CREATE OR ALTER VIEW dbo.vw_AvgSalary_All
+AS
+SELECT COUNT(*) AS EmpCount, AVG(Salary) AS AVG_ALL
+FROM dbo.Employees;
+GO
+
+CREATE OR ALTER VIEW dbo.vw_AvgSalary_WithoutTarget
+AS
+SELECT COUNT(*) AS EmpCount, AVG(Salary) AS AVG_Without_Target
+FROM dbo.Employees
+WHERE EmpID <> 6;
+GO
+
+GRANT SELECT ON dbo.vw_AvgSalary_All           TO public_role;
+GRANT SELECT ON dbo.vw_AvgSalary_WithoutTarget TO public_role;
+GO
+
+/* The attack: the public user infers the target salary from the two views */
+EXECUTE AS USER = 'general';
+
+SELECT USER_NAME() AS CurrentUser;
+
+SELECT * FROM dbo.vw_AvgSalary_All;            -- 6 employees, AVG 95000
+SELECT * FROM dbo.vw_AvgSalary_WithoutTarget;  -- 5 employees, AVG 100000
+
+-- Expected: 70000 (Ahmed's salary)
+SELECT a.EmpCount * a.AVG_ALL - w.EmpCount * w.AVG_Without_Target AS Inferred_Salary
+FROM dbo.vw_AvgSalary_All AS a
+CROSS JOIN dbo.vw_AvgSalary_WithoutTarget AS w;
+
+REVERT;
+GO
+
+/* 2. Apply K-anonymity rule (k = 2)
+A result is returned only if:
+- it covers at least k employees
+- and the employees left out are 0 or at least k
+So no single employee can be found by subtracting two results. */
+ALTER VIEW dbo.vw_AvgSalary_All
+AS
+SELECT COUNT(*) AS EmpCount, AVG(Salary) AS AVG_ALL
+FROM dbo.Employees
+HAVING COUNT(*) >= 2
+AND ((SELECT COUNT(*) FROM dbo.Employees) - COUNT(*) = 0
+  OR (SELECT COUNT(*) FROM dbo.Employees) - COUNT(*) >= 2);
+GO
+
+ALTER VIEW dbo.vw_AvgSalary_WithoutTarget
+AS
+SELECT COUNT(*) AS EmpCount, AVG(Salary) AS AVG_Without_Target
+FROM dbo.Employees
+WHERE EmpID <> 6
+HAVING COUNT(*) >= 2
+AND ((SELECT COUNT(*) FROM dbo.Employees) - COUNT(*) = 0
+  OR (SELECT COUNT(*) FROM dbo.Employees) - COUNT(*) >= 2);
+GO
+
+/* 3. Demonstrate that inference is blocked */
+EXECUTE AS USER = 'general';
+
+SELECT USER_NAME() AS CurrentUser;
+
+-- Expected: 6 employees, AVG 95000 (nobody left out)
+SELECT * FROM dbo.vw_AvgSalary_All;
+
+-- Expected: no rows (only 1 employee left out -> blocked)
+SELECT * FROM dbo.vw_AvgSalary_WithoutTarget;
+
+-- Expected: no rows -> the target salary can not be inferred
+SELECT a.EmpCount * a.AVG_ALL - w.EmpCount * w.AVG_Without_Target AS Inferred_Salary
+FROM dbo.vw_AvgSalary_All AS a
+CROSS JOIN dbo.vw_AvgSalary_WithoutTarget AS w;
+
+REVERT;
+GO
